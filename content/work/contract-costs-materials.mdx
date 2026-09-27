@@ -1,0 +1,53 @@
+## The problem
+
+Estimating what a project will cost means combining two kinds of data that don't join up. Public procurement records show what buyers actually paid for whole projects, but not which materials drove the cost. Materials databases describe the technical properties of materials, but not what they cost in a real project.
+
+I split the problem in two. First, can contract value be predicted from procurement records? Second, can technically similar but cheaper materials be found, even when most materials have no price?
+
+## Part 1: predicting contract value
+
+### Data
+
+I used contract award notices from Tenders Electronic Daily (TED), the EU's public procurement journal. Cleaning brought them down to **46,503 contracts** and 15 columns. Two steps mattered most:
+
+- **Removing leakage.** Fields such as the winning bidder and the awarded amount are only known after the award, and a model that sees them is effectively reading the answer. I removed them all.
+- **Translating titles.** Contract titles come in many EU languages. I machine-translated **25,239 unique titles** to English so the model could use one consistent text field.
+
+Contract values are heavily skewed, with many small contracts and a few enormous ones, so models learned on the log of the value and were scored in euros.
+
+### Results
+
+I compared linear regression, ridge, gradient boosting, histogram gradient boosting, XGBoost and random forest. **Random forest was best**, with R² ≈ 0.82 and a mean absolute error of about **€1.07 M**. RMSE was €13.47 M, because a handful of very large contracts dominate the squared error, so I reported both.
+
+Tuning with cross-validation raised the cross-validation score slightly, but on the held-out test set the tuned forest was no better, and slightly worse on some metrics. So I kept the simpler baseline. More tuning isn't automatically better generalisation.
+
+## Part 2: finding cheaper, similar materials
+
+### Pricing materials that have no price
+
+Most materials in the dataset have no market price. I used World Bank commodity prices as a pricing backbone, with a fallback hierarchy:
+
+- an exact commodity match where one exists,
+- otherwise the price of the material's main element,
+- otherwise a family-level price.
+
+Every match carries a confidence label. **213 materials** ended up with a usable price: **72 high confidence, 103 medium and 38 low.**
+
+### Grouping similar materials
+
+I clustered materials on their standardised technical properties. After comparing K-Means and DBSCAN, **K-Means with 5 clusters** gave the most useful groups, with a silhouette score of 0.58 and a Davies–Bouldin score of 0.61.
+
+Within each cluster, I ranked materials into cost classes and used nearest-neighbour search to find the closest cheaper alternatives. Finally, I applied the pipeline to real TED projects, such as power cable contracts, to show what the suggestions look like in practice.
+
+## Limits worth stating
+
+- **A contract value isn't a materials cost.** It also includes labour, logistics, overhead and margin. Part 1 predicts project spend, not a bill of materials.
+- **Commodity prices aren't component prices.** A price for copper isn't the price of a finished cable, which is why the confidence labels matter.
+- **Similar isn't interchangeable.** Two materials can be close in property space and still not be substitutes for a given job. An engineer has to check.
+- **The test split was random.** Real forecasting predicts future contracts from past ones.
+
+## What I'd do next
+
+- Validate on a time-based split, training on earlier years and testing on later ones.
+- Link procurement projects to specific materials, so the two parts feed into each other.
+- Add regional and date-specific prices, and track how price uncertainty carries through to the suggestions.

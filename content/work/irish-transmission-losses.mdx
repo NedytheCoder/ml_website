@@ -1,0 +1,51 @@
+## The problem
+
+Electricity loses energy as it travels along transmission lines. In Ireland's Single Electricity Market, each generator's output is multiplied by a Transmission Loss Adjustment Factor (TLAF) to account for this. A plant with a TLAF of 0.96 is credited with 4% less than it actually produced.
+
+I wanted to know whether there are clear patterns in which generators lose the most, and what drives them.
+
+## The data
+
+- **TLAFs:** the approved 2025–26 factors, covering 331 generators.
+- **Plants:** 397 generators on the island of Ireland, from OpenStreetMap.
+- **Boundaries:** county maps for the Republic and Northern Ireland.
+
+Joining the two lists was the hard part. Station names in the TLAF sheet don't match OpenStreetMap names, and some newer plants aren't in the TLAF sheet yet. I matched them carefully by hand, with extra searches for hydro plants by river name. I kept **212 plants** I was confident in rather than guessing. Plant capacity was recorded in mixed formats, so I cleaned it and filled gaps with the average for each fuel type.
+
+## First attempt: six features
+
+I clustered the 212 plants on TLAF, voltage, capacity, fuel type, county and country, using four methods, and scored them with three standard clustering metrics:
+
+| Method | Silhouette (higher is better) | Davies–Bouldin (lower is better) | Calinski–Harabasz (higher is better) |
+| --- | --- | --- | --- |
+| K-Means, 3 clusters | 0.342 | 1.185 | 73.4 |
+| DBSCAN | 0.531 | 0.589 | 117.2 |
+| Hierarchical (Ward), 3 clusters | 0.317 | 1.188 | 67.6 |
+| Gaussian mixture, 3 clusters | 0.340 | 1.189 | 72.1 |
+
+DBSCAN scored best, but those scores cover only 138 plants; it discarded the other 74 as noise, and it only found clusters among wind farms. K-Means and the Gaussian mixture agreed almost exactly, which made K-Means the most trustworthy choice.
+
+To explain the clusters, I trained a classifier to predict each plant's cluster and ran SHAP on it. **Country dominated**, with an importance of 1.49, three times that of capacity (0.48) and voltage (0.47).
+
+The map explains why. Northern Ireland's plants sit close to the heaviest demand in the north and east. Plants in the Republic are spread over a larger, more mountainous area, so their power travels further. The 20 worst-performing plants are concentrated in **Cork (8) and Mayo (6)**, and wind farms are the largest group, at 9 of the 20. The worst is Oweninny Wind Farm in Mayo, at a TLAF of 0.964.
+
+## Second attempt: what "country" was hiding
+
+Country isn't a physical cause. It stands in for geography. So I replaced it with the actual geography: each plant's distance to the 110, 220 and 400 kV transmission lines, to Dublin, to the nearest major city and to the nearest other plant. That brought the model to 12 features.
+
+The clustering scores got worse: K-Means' silhouette dropped from 0.34 to 0.23, and DBSCAN found no clusters at all, because the new features vary smoothly. But the clusters became **more meaningful**:
+
+- Large high-voltage stations
+- Wind and solar in the Republic
+- East-coast plants
+- Remote plants in Northern Ireland
+
+SHAP now ranked **distance to Dublin (0.63)** and **distance to the 220 kV (0.48) and 400 kV (0.45) networks** highest. Country fell to 0.20.
+
+The takeaway: a better clustering score doesn't mean better insight. The first version scored higher because it split plants along a border. The second scored lower but pointed at something an engineer could act on, like how far a plant is from the high-voltage network.
+
+## What I'd do next
+
+- Predict TLAF directly with regression on the network features, instead of clustering and explaining afterwards.
+- Add TLAFs from previous years to see which regions are getting better or worse.
+- Use actual line routes and capacities, not just straight-line distance to the nearest line.

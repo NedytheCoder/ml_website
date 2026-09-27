@@ -1,0 +1,83 @@
+## The problem
+
+When a large generator trips, grid frequency starts falling. It keeps falling until governors and reserves catch it, and the lowest point it reaches, the nadir, decides whether automatic load shedding kicks in and customers lose power.
+
+As wind and solar replace spinning generators, the grid loses inertia. Frequency falls faster and deeper, and operators have less time to act. So the question I set out to answer was: from the first few hundred milliseconds after a trip, can a model predict how low frequency will go? And does a transformer actually do better than simpler models?
+
+## Building the dataset
+
+There is no public dataset of labelled generator trips at this scale, so I generated one. I simulated trips on the IEEE 39-bus test system in ANDES, a power system dynamics simulator, varying the conditions that matter most:
+
+- **Inertia:** 23, 15 and 8 GW·s
+- **Share of wind and solar:** 10, 25, 40 and 50%
+- **Load:** 60, 80 and 100% of nominal
+- **Trip size** (5–15% of generation) and **reserve** (1.3–3× the lost output), drawn at random within every combination
+
+That gives 36 combinations and **38,412 scenarios, with no failed runs**. Each scenario gives the model a 100-value snapshot of the grid just before the trip, plus 500 ms of simulated PMU readings (frequency and rate of change of frequency at every generator, every 10 ms). The targets are the nadir frequency and the time it happens.
+
+### Making the benchmark behave
+
+The stock 39-bus case never produced a nadir at all. After a trip, frequency slid smoothly down to its new level. Four changes made it behave like a real grid: slower steam turbines, droop rescaled to 5% on the system's own base, reserve that can actually run out, and some load damping. Without damping, a third of scenarios fell below the load-shedding threshold and 18% never recovered.
+
+The tripped generator's own bus also produced a huge measurement spike, a median 32 Hz/s against 4.7 Hz/s everywhere else. I masked those channels so no model could learn from a glitch.
+
+## Models
+
+- **Transformer:** encoder-only, 4 layers, 8 heads, 2.17 M parameters. It reads a summary token, the pre-trip snapshot, then one token per PMU reading.
+- **Learned baselines:** LSTM (247 k parameters), CNN (58 k), and SPM-BPNN, a dense network from the literature (341 k).
+- **Simple baselines:** ridge regression, and the standard analytical formula grid engineers use (the Anderson–Mitra frequency response model).
+
+Every learned model went through the same training loop, schedule and early-stopping rule, so differences come from architecture, not tuning effort. Each setup ran with three random seeds. The one exception was the 500 ms transformer, which took about 65 hours per run.
+
+I ran three experiments: how short the input window can be, how models cope with measurement noise, and whether the pre-trip snapshot helps.
+
+## Results
+
+### The window matters more than the architecture
+
+Mean absolute error of the nadir prediction, in mHz (mean ± standard deviation over three seeds):
+
+| Model | 20 ms | 50 ms | 100 ms | 500 ms |
+| --- | --- | --- | --- | --- |
+| Dense (BPNN) | 48.41 ± 0.40 | 48.01 ± 0.54 | 48.30 ± 0.52 | 41.50 ± 0.57 |
+| CNN | 49.44 ± 0.38 | 49.24 ± 0.45 | 49.39 ± 0.52 | 42.30 ± 0.72 |
+| LSTM | 49.66 ± 0.76 | 49.22 ± 0.63 | 48.88 ± 0.50 | 39.47 ± 1.27 |
+| Transformer | 49.89 ± 1.55 | 51.22 ± 1.68 | 48.36 ± 0.77 | 38.41 (one seed) |
+| Ridge | 53.88 | 51.13 | 50.92 | 45.45 |
+
+Below 100 ms, nothing separates the models. Four architectures whose sizes differ by a factor of 40 all land between 48 and 50 mHz, and ridge regression is only a few mHz behind. There just isn't enough information in the first 100 ms.
+
+At 500 ms, the sequence models pull ahead. **The transformer and the LSTM tie:** 38.41 is inside one standard deviation of 39.47, and the transformer took **3,898 minutes to train against the LSTM's 220**, about 18 times longer.
+
+### Noise flips the result
+
+All models were trained on clean data and then tested with realistic PMU noise added. At 500 ms and 0.01 Hz of noise:
+
+| Model | Error (mHz) |
+| --- | --- |
+| Transformer | 175 |
+| LSTM | 372 |
+| CNN | 540 |
+| Dense (BPNN) | 9,248 |
+
+Long windows collapse under noise, because frequency differences and rates of change amplify it. Under realistic noise, the best model in the whole study is a **50 ms LSTM**, at 80 mHz with 0.005 Hz of noise. That is the opposite of the clean-data recommendation, and it's the recommendation that matters in a control room.
+
+This is where the transformer earns its place. At 500 ms it degrades **50 times more gracefully than the dense network**. Attention can down-weight corrupted readings; a dense layer applies fixed weights to every sample. That is the one clear transformer result in the study.
+
+### Other findings
+
+- **The pre-trip snapshot helps more with longer windows:** 8.8% lower error at 100 ms, and 20.7% at 500 ms (one seed, so indicative only).
+- **The analytical formula fails where it matters most.** Even after calibration its error is 183 mHz, and in 22.2% of scenarios it predicts no nadir at all. Every one of those is a low-inertia scenario, exactly the grid this project is about.
+- **Predicting when the nadir happens doesn't work.** Every model reached an R² of only 0.48–0.53 on nadir timing. The study answers "how deep", not "when".
+
+## What went wrong
+
+**Every model hit the same wall.** My first full run stalled between 48 and 52 mHz for every architecture and window. I suspected the learning rate, and I was wrong. The raw windows were almost rank-1: readings 10 ms apart are nearly identical, so gradient descent had almost no useful direction to move in. Feeding the models differences between readings instead fixed it, and the 500 ms LSTM dropped to 38.2 mHz. The lesson: when every model plateaus at the same place, look at the data, not the models.
+
+**A rule for rerunning "failed" runs was itself the failure.** One transformer run looked broken, so I wrote a rule for rerunning runs that stopped learning too early. The rerun broke the same rule. Running three seeds showed both runs were normal draws from a wide spread. Rerunning until a run passes is cherry-picking, so I dropped the rule and kept both runs as evidence.
+
+## What I'd do next
+
+- Train with noise. Every model here saw only clean data, so the noise results measure robustness to something unseen. Noise-aware training would very likely recover much of the loss.
+- Save checkpoints during training. A 65-hour run that crashes near the end currently loses everything.
+- Test on a 50 Hz grid model. The 39-bus system runs at 60 Hz; the motivation is Ireland's 50 Hz grid.
